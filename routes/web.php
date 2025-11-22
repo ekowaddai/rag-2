@@ -1,8 +1,9 @@
 <?php
 
 use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\ExamAIController;
 
-use Illuminate\Support\Facades\Http;
+// use Illuminate\Support\Facades\Http;
 /*
 |--------------------------------------------------------------------------
 | Web Routes
@@ -18,171 +19,36 @@ Route::get('/', function () {
     return view('welcome');
 });
 
-
-Route::post('/chat', 'App\Http\Controllers\ChatController');
-
-
-Route::get('/test-ollama', function () {
-    $prompt = "Hi! Please respond to test if you are working.";
-
-    $response = Http::post('http://localhost:11434/api/generate', [
-        'model' => 'llama3.2:1b',
-        'prompt' => $prompt,
-        'stream' => false
-    ]);
-
-    if ($response->failed()) {
-        return response()->json([
-            'status' => 'failed',
-            'error' => $response->json()
-        ], 500);
-    }
-
-    return response()->json([
-        'status' => 'success',
-        'prompt' => $prompt,
-        'response' => $response->json()['response'] ?? null
-    ]);
-});
-
+Route::get('/exam-ai', [ExamAIController::class, 'index'])->name('exam.ai');
+Route::post('/exam-ai', [ExamAIController::class, 'ask'])->name('exam.ai.ask');
 
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
 
-Route::get('/test-rag-old', function () {
+Route::get('/test-ai', function () {
+    // Fetch a sample
+    $records = DB::table('exam_results')->limit(2)->get();
 
-    // Hardcoded test query
-    $query = "What are the stages of photosynthesis?";
+    $context = $records->map(function ($r) {
+        return "Index: {$r->IndexNumber}, Name: {$r->Surname} {$r->OtherName}, "
+             . "Subject: {$r->Subject}, Mark: {$r->ExamMark}, "
+             . "Status: {$r->ExamStatus}";
+    })->implode("\n");
 
-    // Step 1: Generate embedding for query
-    $embeddingResponse = Http::post('http://localhost:11434/api/embeddings', [
-        'model' => 'llama3.2:1b',
-        'prompt' => $query
-    ]);
+    $prompt = "
+You are testing the AI exam assistant.
+Use the following sample data to produce a summary.
 
-    if ($embeddingResponse->failed()) {
-        return response()->json(['error' => 'Failed to generate embedding'], 500);
-    }
+$context
+";
 
-    $queryEmbedding = $embeddingResponse->json()['embedding']; // array of floats
-
-    // Step 2: Retrieve top 3 most similar documents
-    $scoreParts = [];
-    foreach ($queryEmbedding as $i => $val) {
-        $scoreParts[] = "embedding->'\$[{$i}]' * ?";
-    }
-    $scoreSql = implode(' + ', $scoreParts);
-
-    $documents = DB::table('documents')
-        ->select('title', 'content')
-        ->selectRaw("($scoreSql) AS score", $queryEmbedding)
-        ->orderByDesc('score')
-        ->limit(3)
-        ->get();
-
-    // Step 3: Build context string
-    $context = "";
-    foreach ($documents as $doc) {
-        $context .= "Title: {$doc->title}\nContent: {$doc->content}\n\n";
-    }
-
-    // Step 4: Build prompt for Ollama
-    $finalPrompt = "Use ONLY the context below to answer the question.\n\n".
-                   "CONTEXT:\n{$context}\n\n".
-                   "QUESTION: {$query}\nANSWER:";
-    
-
-    /* Forcing it to use the context
-    $finalPrompt = "You are a helpful assistant. Answer the question using ONLY the context below. " .
-               "Do NOT use any prior knowledge outside of this context.\n\n" .
-               "CONTEXT:\n{$context}\n\n" .
-               "QUESTION: {$query}\n" .
-               "ANSWER:";
-    */
-    // Step 5: Send to Ollama
     $response = Http::post('http://localhost:11434/api/generate', [
-        'model' => 'llama3.2:1b',
-        'prompt' => $finalPrompt,
-        'stream' => false
+        'model'     => 'llama3',
+        'prompt'    => $prompt,
     ]);
 
-    if ($response->failed()) {
-        return response()->json(['error' => 'Ollama request failed'], 500);
-    }
-
-    return response()->json([
-        'query' => $query,
-        'retrieved_documents' => $documents,
-        'response' => $response->json()['response'] ?? null
-    ]);
-});
-
-
-
-
-Route::get('/test-rag', function () {
-
-    // 1️⃣ Hardcoded test query
-    $query = "What are the stages of photosynthesis?";
-
-    // 2️⃣ Generate embedding for query via Ollama
-    $embeddingResponse = Http::post('http://localhost:11434/api/embeddings', [
-        'model' => 'llama3.2:1b',
-        'prompt' => $query
-    ]);
-
-    if ($embeddingResponse->failed()) {
-        return response()->json(['error' => 'Failed to generate embedding'], 500);
-    }
-
-    $queryEmbedding = $embeddingResponse->json()['embedding']; // array of floats
-
-    // 3️⃣ Retrieve all documents from DB
-    $documents = DB::table('documents')->get();
-
-    // 4️⃣ Compute dot product similarity in PHP
-    $dotProduct = function(array $vec1, array $vec2) {
-        $sum = 0;
-        foreach ($vec1 as $i => $v) {
-            $sum += $v * ($vec2[$i] ?? 0);
-        }
-        return $sum;
-    };
-
-    foreach ($documents as $doc) {
-        $docEmbedding = json_decode($doc->embedding, true);
-        $doc->score = $dotProduct($docEmbedding, $queryEmbedding);
-    }
-
-    // 5️⃣ Sort by score descending and pick top 3
-    $topDocs = collect($documents)
-        ->sortByDesc('score')
-        ->take(3);
-
-    // 6️⃣ Build context string
-    $context = "";
-    foreach ($topDocs as $doc) {
-        $context .= "Title: {$doc->title}\nContent: {$doc->content}\n\n";
-    }
-
-    // 7️⃣ Build final prompt for Ollama
-    $finalPrompt = "Use ONLY the context below to answer the question.\n\n".
-                   "CONTEXT:\n{$context}\n\n".
-                   "QUESTION: {$query}\nANSWER:";
-
-    // 8️⃣ Send to Ollama
-    $response = Http::post('http://localhost:11434/api/generate', [
-        'model' => 'llama3.2:1b',
-        'prompt' => $finalPrompt,
-        'stream' => false
-    ]);
-
-    if ($response->failed()) {
-        return response()->json(['error' => 'Ollama request failed'], 500);
-    }
-
-    return response()->json([
-        'query' => $query,
-        'retrieved_documents' => $topDocs,
-        'response' => $response->json()['response'] ?? null
-    ]);
+    return [
+        'sample_data' => $records,
+        'ai_response' => $response->json('response'),
+    ];
 });

@@ -5,108 +5,172 @@ namespace App\Services;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 
-class RagService
+class TextToSqlService
 {
     protected string $model = 'llama3.2:1b';
 
     /**
-     * Generate embedding from Ollama
+     * Step 1: Ask Ollama to generate a SAFE SQL query from natural language.
      */
-    public function embed(string $text): array
+    public function generateSql(string $question): ?string
     {
-        $response = Http::post('http://localhost:11434/api/embeddings', [
-            'model' => $this->model,
-            'prompt' => $text
-        ]);
+        $prompt = <<<EOT
+You are an expert MySQL query generator.
 
-        if ($response->failed()) {
-            throw new \Exception("Failed to generate embedding");
-        }
+Your job is to convert a user question into a **single, safe, SELECT-only SQL query**.
 
-        return $response->json()['embedding'];
-    }
+RULES:
+- Return ONLY the SQL query.
+- No explanations, comments, markdown, formatting or text.
+- The query MUST start with "SELECT".
+- Never include UPDATE, DELETE, INSERT, DROP, ALTER, TRUNCATE or any modification statement.
+- Use EXACT table and column names.
 
-    /**
-     * Retrieve top N relevant documents from DB using PHP similarity
-     */
-    public function retrieveRelevantDocuments(array $queryEmbedding, int $limit = 3)
-    {
-        $documents = DB::table('documents')->get();
+DATABASE SCHEMA:
+Table: exam_results
+Columns:
+- id
+- IndexNumber
+- Surname
+- OtherName
+- Category
+- Subject
+- ExamMark
+- ExamStatus
+- Institution
+- ExamName
+- created_at
+- updated_at
 
-        // Compute dot product similarity in PHP
-        $dotProduct = function(array $vec1, array $vec2) {
-            $sum = 0;
-            foreach ($vec1 as $i => $v) {
-                $sum += $v * ($vec2[$i] ?? 0);
-            }
-            return $sum;
-        };
+If the question cannot be answered with this table, return:
+SELECT 'I do not know' AS message;
 
-        foreach ($documents as $doc) {
-            $docEmbedding = json_decode($doc->embedding, true);
-            $doc->score = $dotProduct($docEmbedding, $queryEmbedding);
-        }
+USER QUESTION: "$question"
 
-        // Sort by score descending and pick top N
-        return collect($documents)
-            ->sortByDesc('score')
-            ->take($limit);
-    }
-
-    /**
-     * Build context string from documents
-     */
-    public function buildContext($documents): string
-    {
-        $context = "";
-        foreach ($documents as $doc) {
-            $context .= "Title: {$doc->title}\nContent: {$doc->content}\n\n";
-        }
-        return $context;
-    }
-
-    /**
-     * Ask Ollama using strict context-only prompt
-     */
-    public function askOllama(string $context, string $question): string
-    {
-        if (empty(trim($context))) {
-            $context = "No relevant documents found.";
-        }
-
-        $finalPrompt = <<<EOD
-You are a helpful assistant. Answer the question using ONLY the context below.
-If the answer is not present in the context, respond with "I do not know."
-
-CONTEXT START
-{$context}
-CONTEXT END
-
-QUESTION: {$question}
-ANSWER:
-EOD;
+Write ONLY the SQL query:
+EOT;
 
         $response = Http::post('http://localhost:11434/api/generate', [
-            'model' => $this->model,
-            'prompt' => $finalPrompt,
-            'stream' => false
+            'model'  => $this->model,
+            'prompt' => $prompt,
+            'stream' => false,
         ]);
 
         if ($response->failed()) {
-            return "Error: Ollama request failed.";
+            return null;
         }
 
-        return $response->json()['response'] ?? 'No response from Ollama';
+        $sql = trim($response->json()['response'] ?? '');
+
+        return $sql;
     }
 
+
     /**
-     * Full RAG pipeline: embed → retrieve → answer
+     * Step 2: Validate SQL before execution.
      */
-    public function answerWithRag(string $query): string
+    public function validateSql(string $sql): bool
     {
-        $embedding = $this->embed($query);
-        $documents = $this->retrieveRelevantDocuments($embedding);
-        $context = $this->buildContext($documents);
-        return $this->askOllama($context, $query);
+        // Allow only SELECT statements at the beginning (ignore whitespace)
+        if (!preg_match('/^\s*SELECT/i', $sql)) {
+            return false;
+        }
+
+        // Reject dangerous SQL keywords
+        $forbidden = ['UPDATE', 'DELETE', 'INSERT', 'DROP', 'ALTER', 'TRUNCATE', 'REPLACE'];
+        foreach ($forbidden as $word) {
+            if (preg_match('/\b' . $word . '\b/i', $sql)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+
+    /**
+     * Step 3: Execute the SQL query safely.
+     */
+    public function executeSql(string $sql)
+    {
+        if (!$this->validateSql($sql)) {
+            return [
+                ['error' => "Unsafe SQL blocked.", 'sql' => $sql]
+            ];
+        }
+
+        try {
+            return DB::select($sql);
+        } catch (\Throwable $e) {
+            return [
+                ['error' => "SQL execution failed: " . $e->getMessage()]
+            ];
+        }
+    }
+
+
+    /**
+     * Step 4: Explain SQL results using Ollama.
+     */
+    public function explainResults(string $question, $results): string
+    {
+        $jsonResult = json_encode($results, JSON_PRETTY_PRINT);
+
+        $prompt = <<<EOT
+You are a data analyst.
+
+Below are the results of an SQL query executed on the exam_results table.
+
+QUESTION:
+$question
+
+SQL RESULT (JSON):
+$jsonResult
+
+Explain the result clearly in plain language.
+If the result contains an error, explain the error politely.
+EOT;
+
+        $response = Http::post('http://localhost:11434/api/generate', [
+            'model'  => $this->model,
+            'prompt' => $prompt,
+            'stream' => false,
+        ]);
+
+        if ($response->failed()) {
+            return "Error: Failed to generate explanation from Ollama.";
+        }
+
+        return $response->json()['response'] ?? 'No explanation returned.';
+    }
+
+
+    /**
+     * Step 5: Full pipeline — Question → SQL → DB → Answer
+     */
+    public function ask(string $question): array
+    {
+        // Generate SQL
+        $sql = $this->generateSql($question);
+
+        if (!$sql) {
+            return [
+                'sql' => null,
+                'results' => null,
+                'answer' => "Failed to generate SQL query."
+            ];
+        }
+
+        // Execute it
+        $results = $this->executeSql($sql);
+
+        // Explain result
+        $answer = $this->explainResults($question, $results);
+
+        return [
+            'sql'     => $sql,
+            'results' => $results,
+            'answer'  => $answer,
+        ];
     }
 }
