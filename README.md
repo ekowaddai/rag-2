@@ -7,6 +7,15 @@
 <a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
 </p>
 
+## RAG 2
+This is a RAG application writen with Laravel PHP.
+
+- It uses AI to generate sql for RAG responses.
+- The user question is converted into an SQL statement and then
+- The SQL statement is run to extrat data from the structured database
+- The stractured data retreived is passed to AI for generation of answers (RAG)
+
+
 ## About Laravel
 
 Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
